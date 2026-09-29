@@ -4,6 +4,24 @@ A specialized Python 3.13 tool designed to translate English medical case report
 
 ---
 
+## GitHub repository metadata
+
+**Description** (the one-line "About" field):
+
+```text
+Translate English dental & medical case reports into fluent Persian — anatomical names protected, clinical terms clickable with explanations, references kept in English.
+```
+
+**Topics** (tags for the GitHub *Topics* field):
+
+```text
+persian  farsi  medical-translation  dental  case-report  pdf-parser  pymupdf  rtl  nlp  python  opencode  gemini  openai  medical-nlp  glossary  healthcare
+```
+
+**Suggested homepage:** leave empty — this is a CLI tool, not a hosted service.
+
+---
+
 ## Key Features
 
 1. **Local PDF & URL Support**:
