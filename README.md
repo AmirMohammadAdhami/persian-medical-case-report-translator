@@ -1,4 +1,4 @@
-# Medical Case Report Translator (مترجم گزارش‌های موردی پزشکی)
+# Medical Case Report Translator (مترجم کیس ریپورت ها و مقالات تخصصی پزشکی و دندانپزشکی)
 
 A specialized Python 3.13 tool designed to translate English medical case report articles into fluent, professional Persian. It extracts PDF structures, preserves multi-column reading order, retains original figures at their exact logical positions, enforces medical terminology rules (with English original in parentheses), and generates an elegant RTL HTML document.
 
