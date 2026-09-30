@@ -2,6 +2,7 @@
 Google Gemini implementation of the Translator interface using google-genai.
 """
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -13,8 +14,14 @@ from .base import (
     CAPTION_TRANSLATOR_SYSTEM_PROMPT,
     MEDICAL_TRANSLATOR_SYSTEM_PROMPT,
     VISION_ANALYSIS_SYSTEM_PROMPT,
+    NonRetryableTranslationError,
+    RetryableTranslationError,
     Translator,
+    classify_translation_error,
+    retry_delay,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Default Gemini model. `gemini-2.5-flash` was retired for new API users
@@ -36,6 +43,9 @@ class GeminiTranslator(Translator):
         enable_vision: bool = False,
         base_url: Optional[str] = None
     ):
+        # Base class owns the glossary cache and stats; see Translator.__init__.
+        super().__init__()
+
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -75,8 +85,11 @@ class GeminiTranslator(Translator):
             "automatic_function_calling": {"disable": True},
         }
 
-    def _generate_with_retry(self, prompt: str, system_instruction: str) -> str:
+    def _generate_with_retry(self, prompt, system_instruction: str) -> str:
+        last_error: Optional[Exception] = None
+
         for attempt in range(1, self.max_retries + 1):
+            self.stats["requests"] += 1
             try:
                 response = self.client.models.generate_content(
                     model=self.model_name,
@@ -86,10 +99,30 @@ class GeminiTranslator(Translator):
                 text = response.text or ""
                 return text.strip()
             except Exception as e:
+                classified = classify_translation_error(e)
+                last_error = classified
+                if isinstance(classified, NonRetryableTranslationError):
+                    self.stats["failures"] += 1
+                    raise NonRetryableTranslationError(
+                        f"Gemini request failed (non-retryable) on model "
+                        f"'{self.model_name}': {e}"
+                    ) from e
                 if attempt == self.max_retries:
-                    raise RuntimeError(f"Gemini API request failed after {self.max_retries} attempts: {e}") from e
-                time.sleep(2 ** attempt)
-        return ""
+                    break
+                self.stats["retries"] += 1
+                delay = retry_delay(attempt)
+                logger.warning(
+                    "Gemini request failed (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt, self.max_retries, delay, e,
+                )
+                time.sleep(delay)
+
+        self.stats["failures"] += 1
+        raise RetryableTranslationError(
+            f"Gemini API request failed after {self.max_retries} attempts: {last_error}"
+        )
+
+    # -- Translator interface ---------------------------------------------
 
     def translate_text(self, text: str) -> str:
         if not text or not text.strip():
@@ -107,14 +140,21 @@ class GeminiTranslator(Translator):
             system_instruction=CAPTION_TRANSLATOR_SYSTEM_PROMPT
         )
 
+    def _translate_with_system(self, system_prompt: str, text: str) -> str:
+        if not text or not text.strip():
+            return ""
+        return self._generate_with_retry(prompt=text, system_instruction=system_prompt)
+
     def describe_image(self, image_path: str) -> Optional[str]:
         if not self.enable_vision:
             return None
 
         path = Path(image_path)
         if not path.exists():
+            logger.warning("Vision analysis skipped: image not found at %s", image_path)
             return None
 
+        last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 img = Image.open(path)
@@ -125,9 +165,11 @@ class GeminiTranslator(Translator):
                 )
                 desc = (response.text or "").strip()
                 return desc if desc else None
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
                 if attempt == self.max_retries:
-                    return None
-                time.sleep(2 ** attempt)
+                    break
+                time.sleep(retry_delay(attempt))
 
+        logger.warning("Vision analysis failed for %s: %s", image_path, last_error)
         return None

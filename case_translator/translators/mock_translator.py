@@ -48,9 +48,12 @@ class MockTranslator(Translator):
         "light-curing": "لایت کیورینگ",
         "fractured fragment": "قطعه شکسته",
         "coronal fragment": "قطعه تاجی",
-        "maxillary central incisor": "دندان پیشین میانی فک بالا",
-        "mandibular": "فک پایین",
-        "maxillary": "فک بالا",
+        # NOTE: anatomical names are deliberately absent from this map. The
+        # project's own rule is that tooth types and position qualifiers
+        # (maxillary, mandibular, incisor, molar, ...) stay in English, so the
+        # offline translator must not "translate" them either — it previously
+        # rendered "mandibular" as "فک پایین", contradicting the rule the prompt
+        # enforces for every real provider.
     }
 
     # Pre-translated common case report headings
@@ -72,11 +75,46 @@ class MockTranslator(Translator):
     }
 
     def __init__(self, enable_vision: bool = False):
+        # Base class owns the glossary cache and stats; see Translator.__init__.
+        super().__init__()
         # Defaults to False for consistency with every other translator.
         # describe_image() returns a fixed canned description, so leaving this
         # ON by default would inject fabricated clinical findings into output.
         self.enable_vision = enable_vision
         self.seen_terms: Set[str] = set()
+
+    def _translate_with_system(self, system_prompt: str, text: str) -> str:
+        """
+        Offline stand-in for a provider call with an explicit system prompt.
+
+        The glossary pass sends a numbered term list; answering it with the
+        normal prose translator would return the list mangled. So the numbered
+        payload is recognised and answered term-by-term from the local map.
+        """
+        if "lexicographer" in system_prompt or "numbered" in system_prompt.lower():
+            lines_out = []
+            for line in (text or "").splitlines():
+                match = re.match(r"\s*(\d+)\.\s*(.+)", line)
+                if not match:
+                    continue
+                number, term = match.group(1), match.group(2).strip()
+                rendering = (
+                    self.MEDICAL_TERM_MAP.get(term.lower())
+                    or self._offline_term(term)
+                )
+                lines_out.append(f"{number}. {rendering}")
+            if lines_out:
+                return "\n".join(lines_out)
+        return self.translate_text(text)
+
+    @staticmethod
+    def _offline_term(term: str) -> str:
+        """Keeps anatomical terms in English, otherwise echoes the term as-is."""
+        from ..glossary import is_anatomical_term
+
+        if is_anatomical_term(term):
+            return term
+        return term
 
     def _inject_terminology(self, text: str) -> str:
         """

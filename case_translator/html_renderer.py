@@ -3,14 +3,19 @@ HTML renderer for generating clean, responsive, RTL Persian medical case report 
 Preserves original reading order, relative figure placement, and mixed Persian/English typography.
 """
 
+import base64
 import html
 import json
+import logging
+import mimetypes
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from .glossary import is_anatomical_term
+from .glossary import is_anatomical_term, normalise_key
 from .models import ContentBlock, Document, ElementType
+
+logger = logging.getLogger(__name__)
 
 
 # Document-structure labels that are not clinical terms.
@@ -33,6 +38,13 @@ _NON_TERM_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
     r"\b(?:dentistry|endodontics|periodontics|orthodontics|prosthodontics|"
     r"restorative dentistry|oral medicine|oral surgery)\b",
 ))
+
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def _fa_number(value) -> str:
+    """Renders a number with Persian digits for display."""
+    return str(value).translate(_FA_DIGITS)
 
 
 def _is_non_term_label(english: str) -> bool:
@@ -151,6 +163,14 @@ class HTMLRenderer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # English terms seen while rendering, in document order.
         self.glossary_terms: List[str] = []
+        # English term -> Persian rendering, captured as the body is rendered.
+        # This is what lets every clickable term get a real explanation without
+        # the pipeline having to guess from the translator's cache.
+        self.glossary_pairs: Dict[str, str] = {}
+        self.bilingual = False
+        self.embed_images = False
+
+    # -- inline formatting -------------------------------------------------
 
     def format_bidi_text(self, text: str) -> str:
         """
@@ -175,9 +195,6 @@ class HTMLRenderer:
         # en-term pass can never rewrite anything inside it.
         pending: List[str] = []
 
-        def _to_en_span(match: re.Match) -> str:
-            return f'<span class="en-term" dir="ltr">{match.group(1)}</span>'
-
         # 1. Glossary pairs first, replaced by placeholders. The placeholder
         #    consumes the Persian term as well as the bracket, so no double
         #    space is left behind.
@@ -200,6 +217,8 @@ class HTMLRenderer:
                 continue
             if english.lower() not in {t.lower() for t in self.glossary_terms}:
                 self.glossary_terms.append(english)
+            # First rendering wins: a term introduced once keeps its wording.
+            self.glossary_pairs.setdefault(normalise_key(english), prefix)
             pending.append(
                 f'<span class="glossary-term" data-term="{html.escape(english, quote=True)}" '
                 f'tabindex="0" role="button">{prefix}'
@@ -219,39 +238,26 @@ class HTMLRenderer:
             marked = marked.replace(f"\x00{index}\x00", markup)
         return marked
 
-    def render(self, document: Document, filename: str = "article.html") -> Path:
-        """
-        Renders the document into an HTML file at output_dir / filename.
-        Returns the path to the written HTML file.
-        """
-        output_file = self.output_dir / filename
-        blocks = document.get_ordered_blocks()
+    # -- images ------------------------------------------------------------
 
-        # The HTML template embeds an explanation for every clickable term, and
-        # that list is finalised as the body is rendered. Reset it here so a
-        # second render never carries terms in from an earlier document.
-        self.glossary_terms = []
+    def _image_src(self, block: ContentBlock) -> str:
+        """Relative asset path, or an inline data URI when embedding is on."""
+        rel_path = block.metadata.get("relative_path", "")
+        if not self.embed_images or not rel_path:
+            return rel_path
 
-        title_text = document.metadata.get("title", "گزارش مورد بالینی")
-        translated_title = title_text
-        for b in blocks:
-            if b.type == ElementType.TITLE and b.translated_content:
-                translated_title = b.translated_content
-                break
+        absolute = self.output_dir / rel_path
+        if not absolute.exists():
+            return rel_path
+        try:
+            mime = mimetypes.guess_type(str(absolute))[0] or "image/png"
+            encoded = base64.b64encode(absolute.read_bytes()).decode("ascii")
+            return f"data:{mime};base64,{encoded}"
+        except OSError as exc:
+            logger.warning("Could not embed image %s: %s", absolute, exc)
+            return rel_path
 
-        body_content = self._render_body(blocks)
-
-        html_content = self._generate_html_template(
-            title=translated_title,
-            original_title=title_text if title_text != translated_title else "",
-            body_content=body_content,
-            metadata=document.metadata
-        )
-
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(html_content)
-
-        return output_file
+    # -- body --------------------------------------------------------------
 
     def _render_body(self, blocks) -> str:
         """
@@ -274,15 +280,18 @@ class HTMLRenderer:
                 # Rendered in header
                 continue
 
+            elif block.type == ElementType.AUTHOR:
+                # Rendered in header as the byline.
+                continue
+
             elif block.type == ElementType.HEADING:
                 if in_references:
                     body_html_parts.append('</ol></section>')
                     in_references = False
 
                 formatted = self.format_bidi_text(content)
-                body_html_parts.append(
-                    f'<h2 class="section-heading" id="{block.id}">{formatted}</h2>'
-                )
+                element = f'<h2 class="section-heading" id="{block.id}">{formatted}</h2>'
+                body_html_parts.append(self._wrap_block(block, element, content))
 
                 if "مرجع" in content or "منابع" in content or "reference" in block.content.lower():
                     in_references = True
@@ -294,7 +303,8 @@ class HTMLRenderer:
                     in_references = False
 
                 formatted = self.format_bidi_text(content)
-                body_html_parts.append(f'<p class="article-paragraph" id="{block.id}">{formatted}</p>')
+                element = f'<p class="article-paragraph" id="{block.id}">{formatted}</p>'
+                body_html_parts.append(self._wrap_block(block, element, content))
 
             elif block.type == ElementType.FIGURE:
                 if in_references:
@@ -302,10 +312,16 @@ class HTMLRenderer:
                     in_references = False
 
                 # Extract figure details
-                rel_path = block.metadata.get("relative_path", "")
                 fig_num = block.metadata.get("figure_num", 1)
                 caption = block.metadata.get("translated_caption") or block.metadata.get("caption", "")
                 vision_desc = block.metadata.get("vision_description")
+
+                sources = [self._image_src(block)]
+                sources.extend(block.metadata.get("sub_images") or [])
+                images_html = "".join(
+                    f'<img src="{src}" alt="شکل {fig_num}" class="figure-img" loading="lazy" />'
+                    for src in sources if src
+                )
 
                 formatted_caption = self.format_bidi_text(caption) if caption else ""
                 vision_card_html = ""
@@ -320,9 +336,7 @@ class HTMLRenderer:
 
                 body_html_parts.append(
                     f'<figure class="article-figure" id="{block.id}">'
-                    f'  <div class="figure-image-wrapper">'
-                    f'    <img src="{rel_path}" alt="شکل {fig_num}" class="figure-img" loading="lazy" />'
-                    f'  </div>'
+                    f'  <div class="figure-image-wrapper">{images_html}</div>'
                     f'  {f"<figcaption class=\"figure-caption\">{formatted_caption}</figcaption>" if formatted_caption else ""}'
                     f'  {vision_card_html}'
                     f'</figure>'
@@ -332,7 +346,8 @@ class HTMLRenderer:
                 # If caption was not already embedded with the figure, render it
                 if not block.metadata.get("figure_id"):
                     formatted = self.format_bidi_text(content)
-                    body_html_parts.append(f'<p class="figure-caption standalone-caption" id="{block.id}">{formatted}</p>')
+                    element = f'<p class="figure-caption standalone-caption" id="{block.id}">{formatted}</p>'
+                    body_html_parts.append(self._wrap_block(block, element, content))
 
             elif block.type == ElementType.REFERENCE:
                 formatted = self.format_bidi_text(content)
@@ -355,12 +370,7 @@ class HTMLRenderer:
                     in_references = True
 
             elif block.type == ElementType.TABLE:
-                formatted = self.format_bidi_text(content)
-                body_html_parts.append(
-                    f'<div class="table-container" id="{block.id}">'
-                    f'  <pre class="table-content">{formatted}</pre>'
-                    f'</div>'
-                )
+                body_html_parts.append(self._render_table(block))
 
             elif block.type == ElementType.OTHER:
                 # Skip minor metadata or render cleanly
@@ -371,25 +381,202 @@ class HTMLRenderer:
 
         return "\n".join(body_html_parts)
 
+    def _render_table(self, block: ContentBlock) -> str:
+        """Renders a detected table as a real HTML table."""
+        rows = block.metadata.get("translated_rows") or block.metadata.get("table_rows")
+        if not rows:
+            formatted = self.format_bidi_text(block.translated_content or block.content)
+            return (
+                f'<div class="table-container" id="{block.id}">'
+                f'  <pre class="table-content">{formatted}</pre>'
+                f'</div>'
+            )
+
+        header_cells = "".join(
+            f'<th scope="col">{self.format_bidi_text(cell)}</th>' for cell in rows[0]
+        )
+        body_rows = []
+        for row in rows[1:]:
+            cells = "".join(f'<td>{self.format_bidi_text(cell)}</td>' for cell in row)
+            body_rows.append(f'<tr>{cells}</tr>')
+
+        return (
+            f'<div class="table-container" id="{block.id}">'
+            f'<table class="data-table">'
+            f'<thead><tr>{header_cells}</tr></thead>'
+            f'<tbody>{"".join(body_rows)}</tbody>'
+            f'</table>'
+            f'</div>'
+        )
+
+    def _wrap_block(self, block: ContentBlock, element_html: str, translation: str) -> str:
+        """
+        Adds review aids around a block: the original text in bilingual mode,
+        plus a badge when the block could not be translated or its numbers drifted.
+        """
+        original = block.content or ""
+        notes: List[str] = []
+
+        if block.metadata.get("translation_failed"):
+            element_html = element_html.replace(
+                'class="', 'data-untranslated="1" class="untranslated ', 1
+            )
+            notes.append(
+                '<span class="block-badge badge-untranslated">'
+                'ترجمه نشد — متن اصلی نمایش داده می‌شود</span>'
+            )
+
+        for warning in block.metadata.get("numeric_warnings") or []:
+            notes.append(f'<span class="block-badge badge-numeric">بررسی عددی: {html.escape(warning)}</span>')
+
+        if self.bilingual and original.strip() and original.strip() != (translation or "").strip():
+            return (
+                f'<div class="bilingual-block">'
+                f'{element_html}'
+                f'<div class="bi-original" dir="ltr" lang="en">{html.escape(original)}</div>'
+                f'</div>'
+                + ("".join(notes) if notes else "")
+            )
+
+        if notes:
+            return element_html + "".join(notes)
+        return element_html
+
+    # -- entry point -------------------------------------------------------
+
+    def _build_notes(self, authored: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """
+        Merges authored explanations with a generated fallback for every term
+        the body actually rendered.
+
+        The fallback must be produced *after* the body is rendered: the previous
+        implementation built it before render(), when glossary_terms was still
+        empty (and render() then reset it), so the loop was dead code and every
+        term without an authored note silently fell back to the generic message.
+        """
+        notes: Dict[str, str] = {}
+        for term, note in (authored or {}).items():
+            notes[normalise_key(term)] = note
+
+        for english in self.glossary_terms:
+            key = normalise_key(english)
+            if key in notes:
+                continue
+            persian = self.glossary_pairs.get(key)
+            if persian:
+                notes[key] = f"{english} در فارسی «{persian}» ترجمه می‌شود."
+        return notes
+
+    def render(self, document: Document, filename: str = "article.html") -> Path:
+        """
+        Renders the document into an HTML file at output_dir / filename.
+        Returns the path to the written HTML file.
+        """
+        output_file = self.output_dir / filename
+        blocks = document.get_ordered_blocks()
+
+        self.bilingual = bool(document.metadata.get("bilingual"))
+        self.embed_images = bool(document.metadata.get("embed_images"))
+
+        # Reset per-render state so a second render never carries terms in from
+        # an earlier document.
+        self.glossary_terms = []
+        self.glossary_pairs = {}
+
+        title_text = document.metadata.get("title", "گزارش مورد بالینی")
+        translated_title = title_text
+        for b in blocks:
+            if b.type == ElementType.TITLE and b.translated_content:
+                translated_title = b.translated_content
+                break
+
+        author_lines = [
+            b.content for b in blocks
+            if b.type == ElementType.AUTHOR and b.content.strip()
+        ]
+
+        # Body first: rendering is what discovers the clickable terms.
+        body_content = self._render_body(blocks)
+        notes = self._build_notes(document.metadata.get("glossary_notes"))
+
+        html_content = self._generate_html_template(
+            title=translated_title,
+            original_title=title_text if title_text != translated_title else "",
+            body_content=body_content,
+            metadata=document.metadata,
+            notes=notes,
+            authors=author_lines,
+        )
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        return output_file
+
+    # -- template ----------------------------------------------------------
+
+    @staticmethod
+    def _report_banner(metadata: dict) -> str:
+        """Builds the warning banner shown when part of the document is untranslated."""
+        report = metadata.get("translation_report") or {}
+        failed = int(report.get("failed") or 0) + int(report.get("skipped") or 0)
+        total = int(report.get("total") or 0)
+        if not failed:
+            return ""
+
+        parts = [
+            f'<div class="report-banner report-banner-warn">',
+            f'  <strong>هشدار:</strong> {_fa_number(failed)} از {_fa_number(total)} '
+            f'بلوک متنی ترجمه نشد و به زبان اصلی باقی مانده است.',
+        ]
+        if report.get("circuit_breaker_tripped"):
+            parts.append(
+                '  <div class="report-detail">ترجمه پس از چند خطای پیاپی متوقف شد '
+                '(احتمالاً سرویس ترجمه در دسترس نبوده است).</div>'
+            )
+        numeric = report.get("numeric_warnings") or []
+        if numeric:
+            parts.append(
+                f'  <div class="report-detail">{_fa_number(len(numeric))} بلوک '
+                f'اختلاف عددی/واحدی با متن مبدأ دارد و برای بازبینی دستی علامت‌گذاری شده است.</div>'
+            )
+        parts.append('</div>')
+        return "\n".join(parts)
+
     def _generate_html_template(
         self,
         title: str,
         original_title: str,
         body_content: str,
-        metadata: dict
+        metadata: dict,
+        notes: Optional[Dict[str, str]] = None,
+        authors: Optional[List[str]] = None,
     ) -> str:
         """Constructs the full HTML document with embedded CSS."""
         escaped_title = html.escape(title)
         escaped_orig = html.escape(original_title) if original_title else ""
 
-        total_pages = metadata.get("total_pages", "")
+        authors_html = ""
+        if authors:
+            joined = " | ".join(html.escape(a) for a in authors)
+            authors_html = f'<p class="article-authors" dir="ltr" lang="en">{joined}</p>'
+
+        report_banner = self._report_banner(metadata)
+        bilingual = bool(metadata.get("bilingual"))
+
+        toggle_html = ""
+        if bilingual:
+            toggle_html = (
+                '<button type="button" class="bilingual-toggle" id="bilingual-toggle" '
+                'aria-pressed="true">نمایش متن اصلی: روشن</button>'
+            )
 
         # Serialise glossary notes defensively: JSON is not a subset of JS
         # string literals, so "</script>" and U+2028/U+2029 would break out of
         # the inline script block and must be escaped.
         notes = {
-            term.lower(): note
-            for term, note in (metadata.get("glossary_notes") or {}).items()
+            normalise_key(term): note
+            for term, note in (notes or {}).items()
         }
         term_notes_json = (
             json.dumps(notes, ensure_ascii=False)
@@ -405,10 +592,6 @@ class HTMLRenderer:
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{escaped_title}</title>
-  <!-- Google Fonts: Vazirmatn -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {{
       --primary-color: #1e3a8a;
@@ -431,7 +614,10 @@ class HTMLRenderer:
     }}
 
     body {{
-      font-family: 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      /* No external web font is loaded: the document must render correctly
+         offline and must not leak the reader's IP to a font CDN. A locally
+         installed Vazirmatn (or any Persian system font) is used if present. */
+      font-family: 'Vazirmatn', 'Vazir', 'IRANSans', 'Sahel', 'Shabnam', Tahoma, 'Segoe UI', Arial, sans-serif;
       background-color: var(--bg-color);
       color: var(--text-color);
       line-height: 1.85;
@@ -486,6 +672,44 @@ class HTMLRenderer:
       margin-top: 0.5rem;
       font-style: italic;
     }}
+
+    .article-authors {{
+      font-size: 0.95rem;
+      color: var(--text-muted);
+      margin-top: 0.75rem;
+      text-align: left;
+      direction: ltr;
+    }}
+
+    .bilingual-toggle {{
+      margin-top: 1rem;
+      background-color: var(--primary-light);
+      color: var(--primary-color);
+      border: 1px solid var(--primary-color);
+      border-radius: 9999px;
+      padding: 0.4rem 1rem;
+      font: inherit;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+    }}
+    .bilingual-toggle:hover {{ background-color: #dbeafe; }}
+
+    /* Translation report banner */
+    .report-banner {{
+      border-radius: var(--radius);
+      padding: 0.9rem 1.1rem;
+      margin-bottom: 1.5rem;
+      font-size: 0.92rem;
+      line-height: 1.7;
+    }}
+    .report-banner-warn {{
+      background-color: #fffbeb;
+      border: 1px solid #fcd34d;
+      border-right: 4px solid #d97706;
+      color: #78350f;
+    }}
+    .report-banner .report-detail {{ margin-top: 0.35rem; font-size: 0.85rem; }}
 
     /* Typography & Headings */
     .section-heading {{
@@ -598,8 +822,10 @@ class HTMLRenderer:
 
     .figure-image-wrapper {{
       display: flex;
+      flex-wrap: wrap;
       justify-content: center;
       align-items: center;
+      gap: 0.5rem;
       background-color: #fafafa;
       border-radius: calc(var(--radius) - 2px);
       padding: 0.5rem;
@@ -708,6 +934,62 @@ class HTMLRenderer:
       white-space: pre-wrap;
     }}
 
+    .data-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.92rem;
+    }}
+    .data-table th,
+    .data-table td {{
+      border: 1px solid var(--border-color);
+      padding: 0.5rem 0.7rem;
+      text-align: right;
+      vertical-align: top;
+    }}
+    .data-table thead th {{
+      background-color: var(--primary-light);
+      color: var(--primary-color);
+      font-weight: 700;
+    }}
+
+    /* Bilingual review mode: original text beside the translation. */
+    .bilingual-block {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 0 1.25rem;
+      align-items: start;
+      border-bottom: 1px dashed var(--border-color);
+      padding-bottom: 0.5rem;
+      margin-bottom: 1rem;
+    }}
+    .bi-original {{
+      direction: ltr;
+      text-align: left;
+      font-size: 0.92rem;
+      line-height: 1.65;
+      color: #475569;
+      background-color: #f8fafc;
+      border-left: 3px solid #cbd5e1;
+      border-radius: 4px;
+      padding: 0.5rem 0.75rem;
+      word-break: break-word;
+    }}
+    body.hide-original .bilingual-block {{ grid-template-columns: 1fr; }}
+    body.hide-original .bilingual-block .bi-original {{ display: none; }}
+
+    /* Review badges */
+    .block-badge {{
+      display: inline-block;
+      font-size: 0.78rem;
+      font-weight: 600;
+      border-radius: 4px;
+      padding: 0.15rem 0.5rem;
+      margin: 0.15rem 0 0.6rem 0;
+    }}
+    .badge-untranslated {{ background-color: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }}
+    .badge-numeric {{ background-color: #fffbeb; color: #92400e; border: 1px solid #fde68a; }}
+    .untranslated {{ background-color: #fff7f7; }}
+
     /* Responsive */
     @media (max-width: 768px) {{
       body {{
@@ -723,6 +1005,7 @@ class HTMLRenderer:
       .section-heading {{
         font-size: 1.2rem;
       }}
+      .bilingual-block {{ grid-template-columns: 1fr; }}
     }}
 
     /* Print Stylesheet */
@@ -744,6 +1027,7 @@ class HTMLRenderer:
       .section-heading {{
         page-break-after: avoid;
       }}
+      .bilingual-toggle {{ display: none; }}
     }}
   </style>
 </head>
@@ -753,7 +1037,11 @@ class HTMLRenderer:
       <div class="article-badge">گزارش مورد بالینی (Medical Case Report)</div>
       <h1 class="article-title">{escaped_title}</h1>
       {f'<p class="article-original-title">{escaped_orig}</p>' if escaped_orig else ""}
+      {authors_html}
+      {toggle_html}
     </header>
+
+    {report_banner}
 
     <main class="article-body">
 {body_content}
@@ -861,6 +1149,17 @@ class HTMLRenderer:
 
     panelClose.addEventListener("click", hidePanel);
     window.addEventListener("resize", function () {{ if (activeTerm) {{ positionPanel(activeTerm); }} }});
+
+    // Bilingual review toggle: hides the original-language column so the page
+    // can be read as a normal translation.
+    var toggle = document.getElementById("bilingual-toggle");
+    if (toggle) {{
+      toggle.addEventListener("click", function () {{
+        var hidden = document.body.classList.toggle("hide-original");
+        toggle.textContent = hidden ? "نمایش متن اصلی: خاموش" : "نمایش متن اصلی: روشن";
+        toggle.setAttribute("aria-pressed", hidden ? "false" : "true");
+      }});
+    }}
   }})();
   </script>
 </body>

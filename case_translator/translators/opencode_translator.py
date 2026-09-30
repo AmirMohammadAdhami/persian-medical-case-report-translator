@@ -14,17 +14,24 @@ URL with a model ID from that gateway's own /models listing.
 """
 
 import base64
+import logging
 import os
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .base import (
     CAPTION_TRANSLATOR_SYSTEM_PROMPT,
     MEDICAL_TRANSLATOR_SYSTEM_PROMPT,
     VISION_ANALYSIS_SYSTEM_PROMPT,
+    NonRetryableTranslationError,
+    RetryableTranslationError,
     Translator,
+    classify_translation_error,
+    retry_delay,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Zen is the pay-as-you-go gateway and the one most keys are provisioned for.
@@ -63,6 +70,11 @@ class OpenCodeTranslator(Translator):
         max_retries: int = 3,
         enable_vision: bool = False
     ):
+        # Base class owns _term_translations and the per-run stats counters.
+        # Without this call the glossary cache never existed and prepare_terms()
+        # died with AttributeError on its first write.
+        super().__init__()
+
         self.api_key = api_key or os.getenv("OPENCODE_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -90,12 +102,15 @@ class OpenCodeTranslator(Translator):
             base_url=self.base_url,
         )
 
-    def _chat_completion(self, system_prompt: str, user_content: any) -> str:
+    def _chat_completion(self, system_prompt: str, user_content: Any) -> str:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
         ]
+        last_error: Optional[Exception] = None
+
         for attempt in range(1, self.max_retries + 1):
+            self.stats["requests"] += 1
             try:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
@@ -109,14 +124,37 @@ class OpenCodeTranslator(Translator):
                 # A model-level rejection (bad model ID for this gateway) will
                 # never succeed on retry, so fail fast with an actionable hint.
                 if self._is_model_rejection(e):
-                    raise RuntimeError(self._model_hint(e)) from e
+                    self.stats["failures"] += 1
+                    raise NonRetryableTranslationError(self._model_hint(e)) from e
+
+                classified = classify_translation_error(e)
+                last_error = classified
+
+                # Auth / connection / bad-model errors are permanent: retrying
+                # them three times with backoff just multiplies the wait.
+                if isinstance(classified, NonRetryableTranslationError):
+                    self.stats["failures"] += 1
+                    raise NonRetryableTranslationError(
+                        f"OpenCode request failed (non-retryable) on model "
+                        f"'{self.model_name}' at '{self.base_url}': {e}"
+                    ) from e
 
                 if attempt == self.max_retries:
-                    raise RuntimeError(
-                        f"OpenCode API request failed on model '{self.model_name}' (endpoint: {self.base_url}) after {self.max_retries} attempts: {e}"
-                    ) from e
-                time.sleep(2 ** attempt)
-        return ""
+                    break
+
+                self.stats["retries"] += 1
+                delay = retry_delay(attempt)
+                logger.warning(
+                    "OpenCode request failed (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt, self.max_retries, delay, e,
+                )
+                time.sleep(delay)
+
+        self.stats["failures"] += 1
+        raise RetryableTranslationError(
+            f"OpenCode API request failed on model '{self.model_name}' "
+            f"(endpoint: {self.base_url}) after {self.max_retries} attempts: {last_error}"
+        )
 
     @staticmethod
     def _is_model_rejection(error: Exception) -> bool:
@@ -172,6 +210,8 @@ class OpenCodeTranslator(Translator):
             entry.get("id") for entry in entries if entry.get("id")
         )
 
+    # -- Translator interface ---------------------------------------------
+
     def translate_text(self, text: str) -> str:
         if not text or not text.strip():
             return ""
@@ -182,12 +222,18 @@ class OpenCodeTranslator(Translator):
             return ""
         return self._chat_completion(CAPTION_TRANSLATOR_SYSTEM_PROMPT, caption)
 
+    def _translate_with_system(self, system_prompt: str, text: str) -> str:
+        if not text or not text.strip():
+            return ""
+        return self._chat_completion(system_prompt, text)
+
     def describe_image(self, image_path: str) -> Optional[str]:
         if not self.enable_vision:
             return None
 
         path = Path(image_path)
         if not path.exists():
+            logger.warning("Vision analysis skipped: image not found at %s", image_path)
             return None
 
         try:
@@ -204,6 +250,9 @@ class OpenCodeTranslator(Translator):
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
             ]
             return self._chat_completion(VISION_ANALYSIS_SYSTEM_PROMPT, user_content)
-        except Exception:
-            # If the selected model is text-only or vision fails, return None gracefully
+        except Exception as exc:  # noqa: BLE001
+            # A text-only model rejects image payloads. Surface the reason
+            # instead of pretending nothing happened: with --enable-vision the
+            # user explicitly asked for descriptions and used to get silence.
+            logger.warning("Vision analysis failed for %s: %s", image_path, exc)
             return None

@@ -20,6 +20,7 @@ Or in one shot, without this script:
 import argparse
 import os
 import pathlib
+import secrets
 import shlex
 import shutil
 import signal
@@ -326,13 +327,22 @@ def main(argv=None) -> int:
 
     env = dict(os.environ)
     if args.password:
+        # Passed through the environment, never on the command line: argv is
+        # world-readable in the process list (ps / Task Manager).
         env["OPENCODE_SERVER_PASSWORD"] = args.password
+
+    # The bridge authenticates its clients. Reuse OPENCODE_BRIDGE_TOKEN when the
+    # user set one, otherwise mint a token here and print it ready to paste into
+    # .env as OPENCODE_API_KEY.
+    bridge_token = os.getenv("OPENCODE_BRIDGE_TOKEN") or secrets.token_urlsafe(24)
+    env["OPENCODE_BRIDGE_TOKEN"] = bridge_token
 
     print(f"[run] starting bridge on port {args.bridge_port} (model: {args.model})")
     print()
     print("  Point the translator at this endpoint:")
     print(f'    OPENCODE_BASE_URL="http://127.0.0.1:{args.bridge_port}/v1"')
     print(f'    OPENCODE_MODEL="{args.model}"')
+    print(f'    OPENCODE_API_KEY="{bridge_token}"')
     print()
     print("  Then, in another terminal:")
     print('    python main.py "sample_case_report.pdf" --provider opencode')

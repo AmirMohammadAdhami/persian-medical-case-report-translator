@@ -3,6 +3,8 @@ Downloader module for obtaining medical case report PDFs from URLs or local path
 Handles HTTP errors, access restrictions, paywalls, and local file validation gracefully.
 """
 
+import hashlib
+import logging
 import os
 import re
 import tempfile
@@ -12,6 +14,12 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import requests
+
+logger = logging.getLogger(__name__)
+
+# Upper bound on a downloaded article. A misconfigured URL (or a redirect to a
+# dataset) could otherwise stream gigabytes into the temp folder.
+MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024
 
 
 class DownloaderError(Exception):
@@ -117,7 +125,11 @@ class ArticleDownloader(BaseDownloader):
         target_path = dest_dir / filename
 
         try:
-            response = self.session.get(url, stream=True, timeout=self.timeout_seconds)
+            # The response must be closed on every path: previously the error
+            # branches returned (raised) before close(), leaking the connection
+            # and, on a streamed response, the socket.
+            with self.session.get(url, stream=True, timeout=self.timeout_seconds) as response:
+                return self._save_response(response, url, target_path)
         except requests.exceptions.SSLError as e:
             raise InaccessibleArticleError(
                 f"SSL certificate verification failed for '{url}': {e}"
@@ -133,6 +145,8 @@ class ArticleDownloader(BaseDownloader):
         except requests.exceptions.RequestException as e:
             raise DownloaderError(f"HTTP request error: {e}") from e
 
+    def _save_response(self, response, url: str, target_path: Path) -> Path:
+        """Validates and streams an HTTP response body to disk."""
         # Handle HTTP status codes
         if response.status_code in (401, 403):
             raise InaccessibleArticleError(
@@ -163,24 +177,52 @@ class ArticleDownloader(BaseDownloader):
                 f"The downloaded resource from '{url}' does not appear to be a valid PDF file."
             )
 
+        declared_size = response.headers.get("Content-Length")
+        if declared_size and declared_size.isdigit() and int(declared_size) > MAX_DOWNLOAD_BYTES:
+            raise DownloaderError(
+                f"The file at '{url}' is {int(declared_size) // (1024 * 1024)} MB, which exceeds the "
+                f"{MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB download limit."
+            )
+
         # Stream save to target path
+        written = 0
         with open(target_path, "wb") as f:
             f.write(first_chunk)
+            written += len(first_chunk)
             for chunk in response.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > MAX_DOWNLOAD_BYTES:
+                    f.close()
+                    target_path.unlink(missing_ok=True)
+                    raise DownloaderError(
+                        f"Download from '{url}' exceeded the "
+                        f"{MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB limit and was aborted."
+                    )
+                f.write(chunk)
 
         self.validate_pdf_content(target_path)
         return target_path
 
-    def _generate_filename(self, url: str) -> str:
-        """Derives a clean filename from the URL."""
+    @staticmethod
+    def _generate_filename(url: str) -> str:
+        """
+        Derives a collision-free filename from the URL.
+
+        The old version used only the last path segment, so two different URLs
+        ending in "/download" (or in nothing at all) wrote to the same temp file
+        and one run could read the other's PDF. A short digest of the full URL
+        is appended to keep them apart.
+        """
         parsed = urlparse(url)
         path = parsed.path.rstrip("/")
-        name = path.split("/")[-1] if path else "article.pdf"
+        name = path.split("/")[-1] if path else "article"
 
         # Sanitize filename
         name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', name)
         if not name.lower().endswith(".pdf"):
             name = f"{name}.pdf"
-        return name
+
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+        return f"{digest}_{name}"

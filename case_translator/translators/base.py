@@ -2,9 +2,12 @@
 Base translator abstraction and medical translation guidelines.
 """
 
+import logging
 import re
 from abc import ABC, abstractmethod
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 MEDICAL_TRANSLATOR_SYSTEM_PROMPT = """You are a professional medical translator specializing in clinical case reports and dentistry/medicine.
@@ -49,6 +52,21 @@ If the provided text is only a document section heading or label (for example "C
 "References", "Discussion", "Case Report"), translate that heading alone. Never reply with a
 request for more text, and never ask the user a question.
 Only return the Persian translation, without any conversational preamble or meta-commentary."""
+
+
+GLOSSARY_SYSTEM_PROMPT = """You are a bilingual dental terminology lexicographer building a
+Persian glossary for a clinical document.
+
+You will receive a numbered list of English dental/medical terms. Translate EVERY term into
+concise, professional Persian (1-3 words) as a practising dentist would write it.
+
+Rules:
+- Return exactly one line per input term, in the same order, as `<number>. <Persian>`.
+- Persian only. Do not add explanations, parentheses, transliterations, or the English term.
+- Anatomical names that are conventionally written in English (incisor, molar, maxillary,
+  mandibular, mesial, distal, buccal, lingual, palatal, occlusal, apical, coronal) must be
+  echoed back EXACTLY as given, unchanged.
+- Never ask a question and never reply with anything other than the numbered list."""
 
 
 REFERENCE_TRANSLATOR_SYSTEM_PROMPT = """You are an academic bibliographic editor preparing the
@@ -141,8 +159,121 @@ def is_non_translation_response(source_text: str, translation: str) -> bool:
     return any(marker in lowered for marker in NON_TRANSLATION_MARKERS)
 
 
+# ---------------------------------------------------------------------------
+# Error taxonomy
+# ---------------------------------------------------------------------------
+#
+# The pipeline needs to tell "this request can never succeed" apart from
+# "the network hiccuped". Retrying an authentication failure three times with
+# exponential backoff turns a 1-second failure into a 6-second one, and with
+# dozens of blocks that is the difference between a fast error and a hang.
+
+
+class TranslationError(RuntimeError):
+    """Base class for provider translation failures."""
+
+
+class NonRetryableTranslationError(TranslationError):
+    """A failure that will not succeed on retry (auth, bad model, connection refused)."""
+
+
+class RetryableTranslationError(TranslationError):
+    """A transient failure worth retrying (timeout, 5xx, rate limit)."""
+
+
+# HTTP status codes that mean "stop asking".
+_NON_RETRYABLE_STATUS = frozenset({400, 401, 403, 404, 422})
+
+# Substrings that identify a permanent failure when no status code is exposed
+# (the SDKs wrap transport errors inconsistently).
+_NON_RETRYABLE_MARKERS = (
+    "connection refused",
+    "connection error",
+    "apiconnectionerror",
+    "invalid api key",
+    "incorrect api key",
+    "unauthorized",
+    "authentication",
+    "permission denied",
+    "model not found",
+    "does not exist",
+    "no such model",
+    "unsupported model",
+    "name resolution",
+    "getaddrinfo",
+    "nodename nor servname",
+    "no address associated",
+    "ssl",
+    "certificate verify failed",
+    "inference_failed",
+)
+
+# Explicitly transient: 429 and 5xx.
+_RETRYABLE_MARKERS = (
+    "rate limit",
+    "too many requests",
+    "overloaded",
+    "timeout",
+    "timed out",
+    "temporarily unavailable",
+    "server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+)
+
+
+def classify_translation_error(error: Exception) -> TranslationError:
+    """
+    Wraps an arbitrary provider exception in the retryable / non-retryable taxonomy.
+
+    Order matters: an explicit transient marker wins over the status-code check,
+    because some SDKs surface a 400-wrapped "rate limit" and some surface 429 as
+    a generic APIError. Non-retryable markers are only consulted after the
+    transient ones, so a "connection error" that mentions "timeout" stays
+    retryable.
+    """
+    if isinstance(error, TranslationError):
+        return error
+
+    text = f"{type(error).__name__}: {error}".lower()
+
+    if any(marker in text for marker in _RETRYABLE_MARKERS):
+        return RetryableTranslationError(str(error))
+
+    status = getattr(error, "status_code", None)
+    if status is None:
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+    if status is not None:
+        try:
+            status_int = int(status)
+        except (TypeError, ValueError):
+            status_int = None
+        if status_int is not None:
+            if status_int == 429 or status_int >= 500:
+                return RetryableTranslationError(str(error))
+            if status_int in _NON_RETRYABLE_STATUS:
+                return NonRetryableTranslationError(str(error))
+
+    if any(marker in text for marker in _NON_RETRYABLE_MARKERS):
+        return NonRetryableTranslationError(str(error))
+
+    # Unknown failures are treated as retryable: the common case is a flaky
+    # network, and a bounded retry budget caps the worst case.
+    return RetryableTranslationError(str(error))
+
+
+def retry_delay(attempt: int, base: float = 1.5, cap: float = 12.0) -> float:
+    """Exponential backoff, capped so a slow provider cannot stall a run."""
+    return min(cap, base * (2 ** (attempt - 1)))
+
+
 class Translator(ABC):
     """Abstract base class for all AI translation providers."""
+
+    #: Providers that bill per call can lower this.
+    max_retries: int = 3
 
     def __init__(self) -> None:
         # Persian rendering of glossary keys, learned once per run.
@@ -151,6 +282,23 @@ class Translator(ABC):
         # render it differently each time. Translating it once and reusing that
         # keeps terminology consistent AND makes repeated terms cheap.
         self._term_translations: dict = {}
+        #: Per-run counters, surfaced in the pipeline's final report.
+        self.stats: dict = {
+            "requests": 0,
+            "retries": 0,
+            "failures": 0,
+            "cache_hits": 0,
+        }
+
+    # -- glossary priming --------------------------------------------------
+
+    @staticmethod
+    def _normalise_term(term: str) -> str:
+        """Mirrors glossary.normalise_key so priming and lookup agree."""
+        key = re.sub(r"\s+", " ", (term or "").strip()).lower()
+        if len(key) > 3 and key.endswith("s") and not key.endswith(("ss", "is", "us")):
+            key = key[:-1]
+        return key
 
     def prepare_terms(self, terms) -> None:
         """
@@ -158,6 +306,10 @@ class Translator(ABC):
 
         Call once, before translating blocks. Keys that fail to translate are
         simply left uncached; callers fall back to a per-block translation.
+
+        Failures are logged rather than swallowed: silently losing the whole
+        glossary pass was previously invisible, which made the "consistent
+        terminology" feature look implemented while doing nothing.
         """
         unique = []
         seen = set()
@@ -181,11 +333,12 @@ class Translator(ABC):
         )
 
         try:
-            raw = self.translate_text(prompt)
-        except Exception:
-            # Glossary priming is an optimisation; never fail a run over it.
+            raw = self._translate_with_system(GLOSSARY_SYSTEM_PROMPT, prompt)
+        except Exception as exc:  # noqa: BLE001 - priming is best-effort
+            logger.warning("Glossary priming failed (%s); falling back to per-block translation.", exc)
             return
 
+        matched = 0
         for line in (raw or "").splitlines():
             match = re.match(r"\s*(\d+)\s*[\.\)\-:]?\s*(.+)", line)
             if not match:
@@ -195,7 +348,21 @@ class Translator(ABC):
                 continue
             rendering = match.group(2).strip().strip(".").strip()
             if rendering:
-                self._term_translations[unique[index - 1].lower()] = rendering
+                self._term_translations[self._normalise_term(unique[index - 1])] = rendering
+                matched += 1
+
+        if matched == 0:
+            logger.warning(
+                "Glossary priming returned no parsable terms (%d requested); "
+                "terminology will not be pre-consolidated.",
+                len(unique),
+            )
+
+    def term_translation(self, term: str) -> Optional[str]:
+        """Cached Persian rendering of a glossary key, if priming produced one."""
+        return self._term_translations.get(self._normalise_term(term))
+
+    # -- translation -------------------------------------------------------
 
     @abstractmethod
     def translate_text(self, text: str) -> str:
@@ -220,9 +387,19 @@ class Translator(ABC):
         """
         return self._translate_with_system(REFERENCE_TRANSLATOR_SYSTEM_PROMPT, reference)
 
+    @abstractmethod
     def _translate_with_system(self, system_prompt: str, text: str) -> str:
-        """Provider hook for translating with a specific system prompt."""
-        return self.translate_text(text)
+        """
+        Translates `text` under an explicit system prompt.
+
+        This is the single point every provider must implement, because the
+        system prompt is what separates medical prose, figure captions,
+        bibliography entries and glossary priming. The previous default
+        implementation ignored the argument entirely and silently reused the
+        medical prompt, so reference and glossary calls were translated with the
+        wrong instructions.
+        """
+        raise NotImplementedError
 
     def describe_image(self, image_path: str) -> Optional[str]:
         """

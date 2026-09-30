@@ -28,7 +28,17 @@ Then point the project at it:
 
     OPENCODE_BASE_URL="http://127.0.0.1:4096/v1"
     OPENCODE_MODEL="mimo-v2.6-flash-free"
-    OPENCODE_API_KEY="local"     # value is ignored by the bridge
+    OPENCODE_API_KEY="<the token printed by the bridge>"
+
+Security
+--------
+The bridge binds to 127.0.0.1 only, requires a Bearer token, refuses requests
+that carry an `Origin` header (i.e. anything a web page could issue), validates
+the `Host` header against loopback names, and requires `Content-Type:
+application/json` on POST. Without those checks any page the user happened to
+have open could POST a text/plain body to this port and spend the user's
+OpenCode quota — a local CSRF, since a simple request needs no preflight and the
+attacker never reads the response.
 
 The bridge speaks just enough OpenAI Chat Completions for this project's usage
 (single system + user message, non-streaming) and translates that onto
@@ -39,7 +49,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hmac
 import json
+import os
+import secrets
 import sys
 import time
 import urllib.error
@@ -50,6 +63,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_OPENCODE_SERVER = "http://127.0.0.1:4096"
 SESSION_TIMEOUT_SECONDS = 600
+
+# Hosts a local bridge may be addressed by. Anything else is a DNS-rebinding
+# attempt: a page on evil.com can point its own hostname at 127.0.0.1 and make
+# the browser send requests to this port.
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
 
 
 class OpenCodeClientError(RuntimeError):
@@ -213,6 +231,58 @@ class BridgeHandler(BaseHTTPRequestHandler):
     server_version = "opencode-bridge/1.0"
     opencode: OpenCodeServerClient
     default_model: str
+    #: Shared secret required on every request. None disables auth (insecure).
+    auth_token: Optional[str] = None
+
+    # ---- security --------------------------------------------------------
+
+    def _host_allowed(self) -> bool:
+        """Rejects DNS-rebinding: only loopback host names are accepted."""
+        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        return host in ALLOWED_HOSTS
+
+    def _origin_allowed(self) -> bool:
+        """
+        Rejects browser-originated cross-site requests.
+
+        A local server with no auth can be driven by any web page the user has
+        open: a form POST of type text/plain is a simple request, so no CORS
+        preflight happens and the response is never read — the side effect (an
+        upstream model call billed to the user) is enough. Requiring a token
+        plus refusing any request that carries an Origin header closes that.
+        """
+        return not self.headers.get("Origin")
+
+    def _token_ok(self) -> bool:
+        if not self.auth_token:
+            return True
+        header = self.headers.get("Authorization") or ""
+        if not header.lower().startswith("bearer "):
+            return False
+        provided = header[7:].strip()
+        return hmac.compare_digest(provided, self.auth_token)
+
+    def _reject_if_unauthorised(self) -> bool:
+        """Returns True when the request was rejected."""
+        if not self._host_allowed():
+            self._send_error(403, "Invalid Host header.", "forbidden")
+            return True
+        if not self._origin_allowed():
+            self._send_error(
+                403,
+                "Cross-origin requests are not accepted by this bridge.",
+                "forbidden",
+            )
+            return True
+        if not self._token_ok():
+            self._send_error(
+                401,
+                "Missing or invalid bridge token. Set OPENCODE_API_KEY to the token "
+                "printed by run_opencode_bridge.py (or OPENCODE_BRIDGE_TOKEN).",
+                "invalid_api_key",
+            )
+            return True
+        return False
 
     # ---- helpers ---------------------------------------------------------
 
@@ -233,6 +303,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
     # ---- routes ----------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802
+        if self._reject_if_unauthorised():
+            return
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self._send_json(
                 200,
@@ -258,8 +330,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._send_error(404, f"Unknown path: {self.path}", "not_found")
 
     def do_POST(self) -> None:  # noqa: N802
+        if self._reject_if_unauthorised():
+            return
+
         if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
             self._send_error(404, f"Unknown path: {self.path}", "not_found")
+            return
+
+        # Requiring a JSON content type also removes the "simple request" trick:
+        # application/json is not a CORS-safelisted value, so a cross-origin
+        # caller would need a preflight that this bridge never grants.
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type and content_type != "application/json":
+            self._send_error(
+                415,
+                f"Unsupported Content-Type '{content_type}'. Send application/json.",
+                "invalid_request_error",
+            )
             return
 
         try:
@@ -339,6 +426,7 @@ def build_server(
     opencode_url: str,
     default_model: str,
     password: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> ThreadingHTTPServer:
     handler = type(
         "BoundBridgeHandler",
@@ -346,6 +434,7 @@ def build_server(
         {
             "opencode": OpenCodeServerClient(opencode_url, password=password),
             "default_model": strip_provider_prefix(default_model),
+            "auth_token": token,
         },
     )
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -369,8 +458,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--password",
-        default=None,
-        help="OPENCODE_SERVER_PASSWORD, if you protected the opencode server with basic auth",
+        default=os.getenv("OPENCODE_SERVER_PASSWORD"),
+        help="OPENCODE_SERVER_PASSWORD for the opencode server. Prefer the environment "
+             "variable: a value on the command line is visible in the process list.",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.getenv("OPENCODE_BRIDGE_TOKEN"),
+        help="Shared secret clients must send as 'Authorization: Bearer <token>'. "
+             "Defaults to OPENCODE_BRIDGE_TOKEN, or a freshly generated token.",
+    )
+    parser.add_argument(
+        "--insecure-no-auth",
+        action="store_true",
+        help="Disable bridge authentication. Any local web page can then spend your "
+             "OpenCode quota; use only on a trusted, single-user machine.",
     )
     parser.add_argument(
         "--check",
@@ -378,6 +480,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Verify the opencode server is reachable, then exit",
     )
     args = parser.parse_args(argv)
+
+    token: Optional[str] = args.token
+    if args.insecure_no_auth:
+        token = None
+    elif not token:
+        token = secrets.token_urlsafe(24)
 
     client = OpenCodeServerClient(args.opencode_url, password=args.password)
 
@@ -407,9 +515,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         opencode_url=args.opencode_url,
         default_model=args.model,
         password=args.password,
+        token=token,
     )
     print(f"[bridge] OpenAI-compatible endpoint: http://127.0.0.1:{args.port}/v1")
     print(f"[bridge] default model: {strip_provider_prefix(args.model)}")
+    if token is None:
+        print(
+            "[bridge] WARNING: authentication is DISABLED. Any local process or web page "
+            "that can reach this port may use your OpenCode quota.",
+            file=sys.stderr,
+        )
+    else:
+        print("[bridge] authentication: required (Bearer token)")
+        if not args.token:
+            print(f"[bridge] generated token: {token}")
+            print("[bridge] put this in your .env so the translator can authenticate:")
+            print(f'[bridge]     OPENCODE_API_KEY="{token}"')
     try:
         server.serve_forever()
     except KeyboardInterrupt:

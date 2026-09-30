@@ -5,7 +5,12 @@ Translators package with factory method for selecting providers.
 import os
 from typing import Optional
 
-from .base import Translator
+from .base import (
+    NonRetryableTranslationError,
+    RetryableTranslationError,
+    TranslationError,
+    Translator,
+)
 from .gemini_translator import DEFAULT_GEMINI_MODEL, GeminiTranslator
 from .mock_translator import MockTranslator
 from .openai_translator import DEFAULT_OPENAI_MODEL, OpenAITranslator
@@ -81,6 +86,9 @@ def get_translator(
 
 __all__ = [
     "Translator",
+    "TranslationError",
+    "NonRetryableTranslationError",
+    "RetryableTranslationError",
     "GeminiTranslator",
     "OpenAITranslator",
     "OpenCodeTranslator",

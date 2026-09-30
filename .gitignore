@@ -61,3 +61,8 @@ desktop.ini
 # Local tooling state
 # ---------------------------------------------------------------
 .workbuddy-ai/
+
+# ---------------------------------------------------------------
+# Translation cache (safe to delete; regenerated on demand)
+# ---------------------------------------------------------------
+.translation-cache/
